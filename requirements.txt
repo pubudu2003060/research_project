@@ -1,0 +1,7 @@
+# Install a CUDA-compatible PyTorch build for GPU/Colab training.
+torch>=2.4,<3
+torch-geometric>=2.6,<3
+transformers>=4.40,<6
+numpy
+pyyaml
+matplotlib

@@ -1,0 +1,12 @@
+data/raw/
+data/processed/
+data/text/
+experiments/checkpoints/
+experiments/logs/
+experiments/runs/
+experiments/comparisons/
+experiments/reports/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+docs/*
