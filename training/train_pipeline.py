@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import math
 import platform
 import random
 import time
@@ -17,10 +18,11 @@ from preprocessing.experiment_data import (
     dataset_manifest, load_experiment_dataset, prepare_text_tokens, validate_dataset,
 )
 from preprocessing.graph_builder import build_train_graph
-from preprocessing.sampling import build_incoming_adjacency, sample_local_graph, split_epoch_train
+from preprocessing.sampling import build_incoming_adjacency, split_epoch_train
 from training.config import ExperimentConfig, semantic_enabled
-from training.losses import bce_loss
-from training.negative_sampling import sample_negatives
+from training.batches import prepare_batch, batch_loss
+from training.precision import checked_step, make_scaler, precision_settings
+from training.profiling import StageProfiler, memory_stats
 
 
 def _write_json(path, value):
@@ -66,9 +68,11 @@ def _lm_signature(model):
 def _check_resume(checkpoint, cfg, manifest, lm_signature):
     if checkpoint.get("format_version") != 2:
         raise ValueError("Old fusion checkpoints are incompatible; start a new run")
-    old = checkpoint["config"]
+    # Fill new execution options with backward-compatible defaults for v2 files.
+    old = ExperimentConfig.from_dict(checkpoint["config"]).to_dict()
     current = cfg.to_dict()
-    allowed = {"max_epochs", "device", "output_dir", "download_if_missing", "raw_dir", "text_dir"}
+    allowed = {"max_epochs", "device", "output_dir", "download_if_missing", "raw_dir", "text_dir",
+               "log_every_batches", "profile_training"}
     changes = [k for k in current if k not in allowed and current[k] != old.get(k)]
     if changes:
         raise ValueError(f"Resume changes experiment settings: {changes}; use a new run")
@@ -135,8 +139,8 @@ def run_experiment(cfg: ExperimentConfig, resume=None, warm_start=None, *, datas
     model = model.to(device)
     optimizer = torch.optim.Adam((p for p in model.parameters() if p.requires_grad),
                                  lr=cfg.lr, weight_decay=cfg.weight_decay)
-    amp = cfg.use_amp and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=amp)
+    amp, amp_dtype = precision_settings(cfg, device)
+    scaler = make_scaler(cfg, device)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
@@ -178,6 +182,9 @@ def run_experiment(cfg: ExperimentConfig, resume=None, warm_start=None, *, datas
         "python": platform.python_version(), "torch": str(torch.__version__),
         "torch_geometric": torch_geometric.__version__, "transformers": transformers.__version__,
         "device": str(device), "amp_enabled": amp, "lm": lm_signature,
+        "amp_dtype": str(amp_dtype) if amp else "float32", "loss_scaling": scaler.is_enabled(),
+        "gpu_name": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+        "execution_implementation": "active-relations-checked-amp-v1",
         "resolved_num_blocks": model.encoder1.num_blocks,
         "warm_start": warm_start_source,
         "resume": str(resume) if resume else None,
@@ -199,40 +206,47 @@ def run_experiment(cfg: ExperimentConfig, resume=None, warm_start=None, *, datas
         graph_rng = random.Random(cfg.seed + epoch * 2 + 1)
         model.train()
         loss_sum, examples = 0.0, 0
-        for start in range(0, len(supervised), cfg.train_batch_size):
+        retries = 0
+        total_batches = math.ceil(len(supervised) / cfg.train_batch_size)
+        model.profiler = StageProfiler(device) if cfg.profile_training else None
+        print(json.dumps({"event": "epoch_start", "epoch": epoch, "batches": total_batches,
+                          "semantic_enabled": use_text}), flush=True)
+        for batch_index, start in enumerate(range(0, len(supervised), cfg.train_batch_size), 1):
             pos = supervised[start:start + cfg.train_batch_size]
-            neg = sample_negatives(pos, dataset.num_entities, known_train, cfg.num_negatives,
-                                   negative_rng, balanced_head_tail=cfg.balanced_head_tail_negatives)
-            seeds = torch.cat([pos[:, [0, 2]].flatten(), neg[..., [0, 2]].flatten()]).unique().tolist()
-            local = sample_local_graph(incoming, seeds, 2 * cfg.layers_per_phase,
-                                       cfg.neighbors_per_hop, graph_rng)
-            local_pos = local.remap(pos).to(device)
-            local_neg = local.remap(neg).to(device)
-            optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
-                entities = model.encode_local(local.global_nodes.to(device), local.edge_index.to(device),
-                                               local.edge_type.to(device), tokens=tokens, use_text=use_text)
-                positive_scores = model.score_triples(entities, local_pos)
-                negative_scores = model.score_triples(entities, local_neg.reshape(-1, 3)).reshape(len(pos), -1)
-                loss = bce_loss(positive_scores, negative_scores)
-            if not torch.isfinite(loss):
-                raise RuntimeError(f"Non-finite loss at epoch {epoch}")
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm,
-                                           error_if_nonfinite=not amp)
-            scaler.step(optimizer)
-            scaler.update()
-            loss_sum += float(loss.detach()) * len(pos)
+            batch = prepare_batch(pos, dataset, known_train, incoming, cfg, negative_rng,
+                                  graph_rng, device, model.profiler)
+            step_result = checked_step(model, optimizer, scaler,
+                lambda: batch_loss(model, batch, tokens, cfg, use_text),
+                grad_clip_norm=cfg.grad_clip_norm, max_retries=cfg.amp_max_retries,
+                profiler=model.profiler)
+            loss_sum += step_result["loss"] * len(pos)
             examples += len(pos)
+            retries += step_result["overflow_retries"]
+            if model.profiler is not None:
+                model.profiler.finish_batch()
+            if batch_index == 1 or batch_index % cfg.log_every_batches == 0 or batch_index == total_batches:
+                elapsed = time.perf_counter() - epoch_started
+                print(json.dumps({"event": "train_progress", "epoch": epoch,
+                    "batch": batch_index, "batches": total_batches,
+                    "loss": round(step_result["loss"], 6), "elapsed_seconds": round(elapsed, 2),
+                    "batches_per_second": round(batch_index / elapsed, 4),
+                    "eta_training_seconds": round((total_batches - batch_index) * elapsed / batch_index, 1),
+                    "semantic_enabled": use_text, "sampled_nodes": len(batch.nodes),
+                    **model.last_semantic_work, "amp_overflow_retries": retries,
+                    "amp_scale": step_result["scale"], **memory_stats(device)}), flush=True)
 
         row = {"epoch": epoch, "loss": loss_sum / examples, "semantic_enabled": use_text,
-               "message_triples": len(mp), "supervision_triples": len(supervised)}
+               "message_triples": len(mp), "supervision_triples": len(supervised),
+               "training_seconds": time.perf_counter() - epoch_started, "amp_overflow_retries": retries}
+        if model.profiler is not None:
+            _write_json(out / f"profile_epoch_{epoch}.json", model.profiler.summary())
+            model.profiler = None
         improved = False
         # Select semantic checkpoints only after the LM path is enabled.
         # Otherwise the proposed-model row could silently be a warm-up baseline.
         eligible = cfg.variant == "baseline" or use_text
         if epoch % cfg.eval_every == 0 or epoch == cfg.max_epochs:
+            print(json.dumps({"event": "validation_start", "epoch": epoch}), flush=True)
             model.eval()
             representations = model.encode_full(full_edges, full_types, tokens=tokens, use_text=use_text)
             metrics = evaluate_filtered(model, representations, dataset.valid, *filters,
@@ -274,6 +288,7 @@ def run_experiment(cfg: ExperimentConfig, resume=None, warm_start=None, *, datas
         raise RuntimeError("No eligible validation checkpoint; increase max_epochs")
     model.load_trainable_state_dict(best_state)
     model.eval()
+    print(json.dumps({"event": "final_evaluation_start", "best_epoch": best_epoch}), flush=True)
     representations = model.encode_full(full_edges, full_types, tokens=tokens, use_text=best_use_text)
     validation = evaluate_filtered(model, representations, dataset.valid, *filters,
                                     batch_size=cfg.eval_triple_batch_size)

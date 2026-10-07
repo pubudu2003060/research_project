@@ -20,7 +20,9 @@ class ExperimentConfig:
     lm_name: str = "roberta-base"
     max_text_length: int = 64
     lm_micro_batch: int = 4
+    relation_lm_micro_batch: int | None = None
     lm_activation_checkpointing: bool = True
+    optimize_semantic_batches: bool = True
     rgat_heads: int = 2
     layers_per_phase: int = 1
     num_blocks: int | None = None
@@ -40,6 +42,10 @@ class ExperimentConfig:
     weight_decay: float = 0.0
     grad_clip_norm: float = 1.0
     use_amp: bool = True
+    amp_dtype: str = "float16"
+    amp_max_retries: int = 16
+    log_every_batches: int = 50
+    profile_training: bool = False
     eval_node_batch_size: int = 128
     eval_triple_batch_size: int = 64
     checkpoint_every: int = 1
@@ -61,6 +67,12 @@ class ExperimentConfig:
                 raise ValueError(f"{name} must be positive")
         if self.kg_dim % 2:
             raise ValueError("ComplEx needs an even kg_dim (packed real/imaginary halves)")
+        if self.relation_lm_micro_batch is not None and self.relation_lm_micro_batch < 1:
+            raise ValueError("relation_lm_micro_batch must be positive or null")
+        if self.amp_dtype not in {"float16", "bfloat16"}:
+            raise ValueError("amp_dtype must be float16 or bfloat16")
+        if self.amp_max_retries < 0 or self.log_every_batches < 1:
+            raise ValueError("amp_max_retries must be nonnegative; log_every_batches must be positive")
         if self.max_text_length < 2 or self.max_text_length > 511:
             raise ValueError("max_text_length must be between 2 and 511 (one extra soft-prompt token)")
         if self.num_blocks is not None and (self.num_blocks < 1 or self.kg_dim % self.num_blocks):

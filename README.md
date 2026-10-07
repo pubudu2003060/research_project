@@ -39,8 +39,11 @@ Random entity embeddings (32) + random relation embeddings (32)
 
 There is **no semantic fusion module**, gate, residual blend with encoder-1
 outputs, or bridge ramp. The prompt is an additional token with its own
-attention-mask entry. Every entity and relation uses this path once warm-up
-ends. LM weights stay frozen, but autograd passes through the LM to train the
+attention-mask entry. Required entity and relation representations use this path once warm-up
+ends. During local training, relation LM work is restricted to the union of
+sampled-edge relations and scored-triple relations. Other rows cannot affect
+that batch's outputs or gradients; full evaluation still encodes every relation.
+LM weights stay frozen, but autograd passes through the LM to train the
 KG encoders and projections. Encoder-internal graph residuals and LayerNorm
 remain part of RGAT; they do not fuse structural and semantic bridge outputs.
 
@@ -161,6 +164,24 @@ checkpointing. If memory is insufficient, reduce `lm_micro_batch` to 1 first,
 then training batch size or neighbors. Change settings in a new run and keep
 baseline/proposed configurations matched. These settings have not yet been
 measured on a Colab GPU.
+
+The preflight distinguishes missing, zero, NaN and Inf gradients. FP16 scale
+overflow gets a bounded retry of the same batch and dropout RNG after GradScaler
+skips the invalid update and reduces its scale. It does not accept disconnected
+gradient paths. `amp_dtype: bfloat16` is also available on supporting CUDA GPUs;
+FP16 remains the default. Changing precision requires a new experiment.
+
+Training prints a compact progress record at the first batch, every
+`log_every_batches` (default 50), and the last batch, with throughput, loss,
+training ETA, sampled nodes, semantic prompt counts, AMP retries and GPU memory.
+`profile_training: true` additionally writes per-stage `profile_epoch_N.json`.
+
+See [performance diagnostics and measured limitations](PERFORMANCE_NOTES.md)
+for matched before/after batch and full-epoch profiling, checkpointing on/off,
+and the Colab commands. `relation_lm_micro_batch: null` keeps the existing LM
+batch size; increase it only after measuring memory. Token IDs/masks are cached
+on device; prompt-conditioned LM outputs are always recomputed. Existing v2
+checkpoints remain loadable with their original precision and research settings.
 
 For a pilot, copy the proposed configuration and set `warmup_epochs: 1`,
 `max_epochs: 3`, and `eval_every: 1`. The notebook does this automatically.

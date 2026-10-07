@@ -18,6 +18,7 @@ class FrozenLM(nn.Module):
         self.lm.config.use_cache = False
         self.hidden_size = int(self.lm.config.hidden_size)
         self.activation_checkpointing = activation_checkpointing
+        self.forward_calls = 0
 
     def train(self, mode=True):
         super().train(mode)
@@ -25,6 +26,7 @@ class FrozenLM(nn.Module):
         return self
 
     def _forward(self, soft_prompt, input_ids, attention_mask):
+        self.forward_calls += 1  # Includes checkpoint recomputation; profiling only.
         # Keep autograd enabled: frozen parameters do not mean frozen inputs.
         embeddings = self.lm.get_input_embeddings()(input_ids)
         embeddings = torch.cat([soft_prompt.unsqueeze(1), embeddings], dim=1)

@@ -34,6 +34,10 @@ def collect_results(root, include_synthetic=False):
             "grad_clip_norm", "use_amp", "lm_micro_batch", "lm_activation_checkpointing",
         )}
         environment = json.loads((path.parent / "environment.json").read_text(encoding="utf-8"))
+        protocol["amp_dtype"] = config.get("amp_dtype", "float16")
+        protocol["relation_lm_micro_batch"] = config.get("relation_lm_micro_batch")
+        protocol["optimize_semantic_batches"] = config.get("optimize_semantic_batches", False)
+        protocol["execution_implementation"] = environment.get("execution_implementation", "original-v2")
         # Do not pool different text resources, frozen weights or warm-start
         # sources into the same repeated-seed group.
         protocol["tokens_sha256"] = manifest.get("tokens_sha256")

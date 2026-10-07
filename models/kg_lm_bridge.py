@@ -18,13 +18,16 @@ class KGLMBridge(nn.Module):
         self.lm_to_kg = nn.Linear(self.lm_dim, kg_dim)
 
     def forward(self, kg_vectors, input_ids, attention_mask, micro_batch=4,
-                condition_on_kg=True):
+                condition_on_kg=True, bulk_transfer=True):
         if kg_vectors.ndim != 2 or kg_vectors.shape[-1] != self.kg_dim:
             raise ValueError("KG vector shape does not match kg_dim")
         if micro_batch < 1:
             raise ValueError("micro_batch must be positive")
         if len(input_ids) != len(kg_vectors) or input_ids.shape != attention_mask.shape:
             raise ValueError("Text and KG batch sizes/masks must match")
+        if bulk_transfer:
+            input_ids = input_ids.to(kg_vectors.device)
+            attention_mask = attention_mask.to(kg_vectors.device)
         outputs = []
         for start in range(0, len(kg_vectors), micro_batch):
             h = kg_vectors[start:start + micro_batch]

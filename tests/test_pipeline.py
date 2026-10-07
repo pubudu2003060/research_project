@@ -383,5 +383,250 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(collect_results(tmp, include_synthetic=True), [])
 
 
+class PerformanceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        torch.set_num_threads(1)
+
+    @staticmethod
+    def relation_fixture(variant="proposed", **settings):
+        cfg = tiny_config(variant=variant, feature_dropout=0., attention_dropout=0., **settings)
+        torch.manual_seed(19)
+        model = ReverseJAKET(10, 7, cfg, lm=tiny_lm()).train()
+        tokens = tiny_tokens()
+        ids = torch.tensor([[0, 20 + i, 2, 1, 1, 1] for i in range(7)])
+        tokens.relations = EntityTokens(ids, (ids != 1).long(), torch.ones(7, dtype=torch.bool))
+        edges = torch.tensor([[0, 1, 2, 3], [1, 0, 3, 2]])
+        types = torch.tensor([0, 7, 2, 9])  # includes inverse relations
+        triples = torch.tensor([[0, 5, 2], [2, 0, 3]])  # relation 5 has no message edge
+        return model, tokens, edges, types, triples
+
+    @staticmethod
+    def original_encode(model, nodes, edges, types, tokens):
+        # Independent transcription of the pre-optimization path, not just
+        # another invocation of the new active-relation branch.
+        from models.reverse_jaket import KGRepresentations
+        cfg = model.cfg
+        h, r = model.entity_emb(nodes), model.scorer.relation_emb.weight
+        def text(v, ids, source, conditioned):
+            return model.bridge(v, source.input_ids[ids], source.attention_mask[ids],
+                                micro_batch=cfg.lm_micro_batch, condition_on_kg=conditioned,
+                                bulk_transfer=False)
+        relation_ids = torch.arange(len(r))
+        if cfg.variant == "text_enhanced":
+            h, r = text(h, nodes, tokens, False), text(r, relation_ids, tokens.relations, False)
+        h = model.encoder1(h, edges, types, relations=r)
+        r = model.encoder1.encode_relations(r, h, edges, types)
+        if cfg.variant == "proposed":
+            h, r = text(h, nodes, tokens, True), text(r, relation_ids, tokens.relations, True)
+        h = model.encoder2(h, edges, types, relations=r)
+        r = model.encoder2.encode_relations(r, h, edges, types)
+        return KGRepresentations(h, r)
+
+    def test_active_relations_match_original_outputs_and_all_parameter_gradients(self):
+        for variant in ("proposed", "text_enhanced"):
+            for checkpointing in (False, True):
+                with self.subTest(variant=variant, checkpointing=checkpointing):
+                    old, tokens, edges, types, triples = self.relation_fixture(
+                        variant, lm_activation_checkpointing=checkpointing)
+                    new = copy.deepcopy(old)
+                    new.cfg.relation_lm_micro_batch = 4
+                    reference = self.original_encode(old, torch.arange(10), edges, types, tokens)
+                    with patch.object(new.bridge.lm, "forward", wraps=new.bridge.lm.forward) as lm_call:
+                        actual = new.encode_local(torch.arange(10), edges, types, tokens, True,
+                                                  scored_relation_ids=triples[:, 1])
+                    self.assertEqual(new.last_semantic_work["relation_prompts"], 3)
+                    self.assertEqual(lm_call.call_count, 5)  # ceil(10/3) + ceil(3/4)
+                    self.assertEqual(actual.valid_relations.nonzero().flatten().tolist(), [0, 2, 5])
+                    torch.testing.assert_close(reference.entities, actual.entities, atol=2e-6, rtol=2e-5)
+                    torch.testing.assert_close(reference.relations[[0, 2, 5]], actual.relations[[0, 2, 5]],
+                                               atol=2e-6, rtol=2e-5)
+                    ref_scores, new_scores = old.score_triples(reference, triples), new.score_triples(actual, triples)
+                    torch.testing.assert_close(ref_scores, new_scores, atol=3e-6, rtol=2e-5)
+                    ref_scores.square().mean().backward()
+                    new_scores.square().mean().backward()
+                    for (name, a), (_, b) in zip(old.named_parameters(), new.named_parameters()):
+                        if a.grad is None:
+                            self.assertIsNone(b.grad, name)
+                        else:
+                            torch.testing.assert_close(a.grad, b.grad, atol=3e-4, rtol=3e-4, msg=name)
+                    with self.assertRaisesRegex(ValueError, "not requested"):
+                        new.score_triples(actual, torch.tensor([[0, 6, 1]]))
+                    new.eval()
+                    full = new.encode_full(edges, types, tokens, True)
+                    self.assertIsNone(full.valid_relations)
+                    self.assertEqual(new.last_semantic_work["relation_prompts"], 7)
+
+    def test_relation_prompt_depends_on_current_kg_vectors(self):
+        model, tokens, edges, types, triples = self.relation_fixture()
+        captured = []
+        hook = model.bridge.register_forward_hook(lambda m, args, out: captured.append((args[0], out)))
+        try:
+            model.encode_local(torch.arange(10), edges, types, tokens, True, triples[:, 1])
+            relation_input, relation_output = captured[1]
+            grad = torch.autograd.grad(relation_output.square().sum(), relation_input)[0]
+            self.assertTrue(torch.isfinite(grad).all() and (grad != 0).any())
+            original = relation_output.detach().clone()
+            with torch.no_grad():
+                model.scorer.relation_emb.weight[5, 0] += 0.5
+            captured.clear()
+            model.encode_local(torch.arange(10), edges, types, tokens, True, triples[:, 1])
+            self.assertGreater(float((original - captured[1][1]).abs().max().detach()), 1e-6)
+        finally:
+            hook.remove()
+
+    def test_token_cache_invalidates_in_place_edits_and_caches_no_hidden_states(self):
+        model, tokens, edges, types, triples = self.relation_fixture()
+        with torch.no_grad():
+            first = model.encode_local(torch.arange(10), edges, types, tokens, True, triples[:, 1])
+            cached = model._token_cache["relation"]
+            model.encode_local(torch.arange(10), edges, types, tokens, True, triples[:, 1])
+            self.assertIs(cached, model._token_cache["relation"])
+            self.assertEqual(cached[2].dtype, torch.long)
+            tokens.relations.input_ids[5, 1] = 35
+            changed = model.encode_local(torch.arange(10), edges, types, tokens, True, triples[:, 1])
+            self.assertIsNot(cached, model._token_cache["relation"])
+            self.assertGreater(float((first.relations[5] - changed.relations[5]).abs().max()), 0)
+
+    def test_gradient_diagnostics_distinguish_none_zero_nan_and_inf(self):
+        from training.precision import gradient_report, assert_gradient_paths
+        model, *_ = self.relation_fixture()
+        params = [p for n, p in model.named_parameters() if n.startswith("encoder1.") and p.requires_grad]
+        params[0].grad = torch.zeros_like(params[0])
+        params[1].grad = torch.full_like(params[1], float("nan"))
+        params[2].grad = torch.full_like(params[2], float("inf"))
+        params[3].grad = torch.ones_like(params[3])
+        report = gradient_report(model)
+        row = report["encoder1"]
+        for key in ("none", "zero", "nan", "inf", "finite_nonzero"):
+            self.assertGreater(row[key], 0, key)
+        with self.assertRaisesRegex(RuntimeError, "Invalid gradient paths"):
+            assert_gradient_paths(model, report)
+
+    def test_real_cpu_fp16_scaler_recovers_overflow_without_updating_invalid_step(self):
+        import contextlib
+        import io
+        from training.precision import checked_step
+        model = torch.nn.Linear(2, 1, bias=False)
+        initial = model.weight.detach().clone()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        scaler = torch.amp.GradScaler("cpu", init_scale=2.**20)
+        draws = []
+        def forward():
+            draws.append(torch.rand(1).item())
+            with torch.autocast("cpu", dtype=torch.float16):
+                return model(torch.ones(1, 2)).float().sum()
+        with patch.object(optimizer, "step", wraps=optimizer.step) as step, contextlib.redirect_stderr(io.StringIO()):
+            result = checked_step(model, optimizer, scaler, forward, grad_clip_norm=10., max_retries=10)
+        self.assertGreater(result["overflow_retries"], 0)
+        self.assertLess(result["scale"], 2.**20)
+        self.assertEqual(step.call_count, 1)
+        self.assertEqual(len(set(draws)), 1)  # exact same dropout/random sequence on retry
+        torch.testing.assert_close(model.weight, initial - 0.1)
+
+    def test_overflow_retries_are_bounded_and_fp32_errors_are_not_hidden(self):
+        import contextlib
+        import io
+        from training.precision import checked_step
+        model = torch.nn.Linear(1, 1, bias=False)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        original = model.weight.detach().clone()
+        # Finite forward with an intentionally broken backward, independent of scale.
+        hook = model.weight.register_hook(lambda grad: grad * float("nan"))
+        try:
+            for enabled in (False, True):
+                with self.subTest(scaling=enabled), contextlib.redirect_stderr(io.StringIO()):
+                    scaler = torch.amp.GradScaler("cpu", enabled=enabled)
+                    with self.assertRaisesRegex(RuntimeError, "Non-finite|non-finite"):
+                        checked_step(model, optimizer, scaler, lambda: model(torch.ones(1, 1)).sum(),
+                                     grad_clip_norm=1., max_retries=1)
+                    torch.testing.assert_close(model.weight, original)
+        finally:
+            hook.remove()
+
+    def test_cpu_mixed_precision_full_gradient_flow_with_checkpointing(self):
+        import contextlib
+        import io
+        from training.precision import checked_step
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype), contextlib.redirect_stderr(io.StringIO()):
+                model, tokens, edges, types, triples = self.relation_fixture()
+                optimizer = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=0.001)
+                def forward():
+                    with torch.autocast("cpu", dtype=dtype):
+                        reps = model.encode_local(torch.arange(10), edges, types, tokens, True, triples[:, 1])
+                        scores = model.score_triples(reps, triples)
+                        return bce_loss(scores[:1], scores[1:])
+                result = checked_step(model, optimizer,
+                    torch.amp.GradScaler("cpu", enabled=dtype == torch.float16), forward,
+                    grad_clip_norm=1., check_paths=True)
+                self.assertTrue(all(row["finite_nonzero"] for row in result["gradients"].values()))
+                self.assertTrue(all(p.grad is None for p in model.bridge.lm.parameters()))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA GPU required; CPU tests do not establish Colab FP16 stability")
+    def test_cuda_fp16_full_gradient_flow(self):
+        from training.precision import checked_step
+        model, tokens, edges, types, triples = self.relation_fixture()
+        model.cuda()
+        edges, types, triples = edges.cuda(), types.cuda(), triples.cuda()
+        optimizer = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=0.001)
+        def forward():
+            with torch.autocast("cuda", dtype=torch.float16):
+                reps = model.encode_local(torch.arange(10, device="cuda"), edges, types, tokens, True, triples[:, 1])
+                scores = model.score_triples(reps, triples)
+                return bce_loss(scores[:1], scores[1:])
+        checked_step(model, optimizer, torch.amp.GradScaler("cuda"), forward,
+                     grad_clip_norm=1., check_paths=True)
+
+    def test_structural_initialization_matches_across_variants(self):
+        states = []
+        for variant in ("baseline", "proposed", "text_enhanced"):
+            torch.manual_seed(42)
+            model = ReverseJAKET(10, 2, tiny_config(variant=variant), lm=tiny_lm())
+            states.append({k: v for k, v in model.state_dict().items() if not k.startswith("bridge.")})
+        for name in states[0]:
+            self.assertTrue(torch.equal(states[0][name], states[1][name]), name)
+            self.assertTrue(torch.equal(states[0][name], states[2][name]), name)
+
+    def test_checkpoint_recomputation_is_equivalent_and_measured(self):
+        results = []
+        for enabled in (False, True):
+            model, tokens, edges, types, triples = self.relation_fixture(lm_activation_checkpointing=enabled)
+            reps = model.encode_local(torch.arange(10), edges, types, tokens, True, triples[:, 1])
+            before = model.bridge.lm.forward_calls
+            scores = model.score_triples(reps, triples)
+            scores.sum().backward()
+            results.append((scores.detach(), model.bridge.kg_to_lm.weight.grad.clone(), before,
+                            model.bridge.lm.forward_calls))
+        torch.testing.assert_close(results[0][0], results[1][0])
+        torch.testing.assert_close(results[0][1], results[1][1])
+        self.assertEqual(results[0][2], results[0][3])
+        self.assertEqual(results[1][3], 2 * results[1][2])
+
+    def test_legacy_v2_config_resume_and_observability(self):
+        import contextlib
+        import io
+        from training.config import ExperimentConfig
+        from training.train_pipeline import _check_resume
+        new_fields = {"relation_lm_micro_batch", "optimize_semantic_batches", "amp_dtype",
+                      "amp_max_retries", "log_every_batches", "profile_training"}
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()) as logs:
+            cfg = tiny_config(str(Path(tmp) / "run"), max_epochs=2, log_every_batches=1, profile_training=True)
+            run_experiment(cfg, dataset=tiny_dataset(), tokens=tiny_tokens(), lm=tiny_lm())
+            checkpoint = Path(cfg.output_dir) / "last_checkpoint.pt"
+            saved = torch.load(checkpoint, weights_only=True)
+            saved["config"] = {k: v for k, v in saved["config"].items() if k not in new_fields}
+            torch.save(saved, checkpoint)
+            cfg.max_epochs = 3
+            run_experiment(cfg, resume=checkpoint, dataset=tiny_dataset(), tokens=tiny_tokens(), lm=tiny_lm())
+            self.assertTrue((Path(cfg.output_dir) / "profile_epoch_3.json").exists())
+            self.assertIn('"event": "train_progress"', logs.getvalue())
+            self.assertIn('"cuda_peak_mib"', logs.getvalue())
+            changed = ExperimentConfig.from_dict(cfg.to_dict())
+            changed.amp_dtype = "bfloat16"
+            with self.assertRaisesRegex(ValueError, "amp_dtype"):
+                _check_resume(saved, changed, saved["manifest"], saved["lm_signature"])
+
+
 if __name__ == "__main__":
     unittest.main()

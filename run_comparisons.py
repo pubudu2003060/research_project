@@ -49,7 +49,7 @@ def main():
             status_path = out / "run_status.json"
             complete = status_path.exists() and json.loads(status_path.read_text(encoding="utf-8")).get("status") == "complete"
             if completed.exists() and saved_config.exists() and complete:
-                if json.loads(saved_config.read_text(encoding="utf-8")) == cfg.to_dict():
+                if load_config(saved_config).to_dict() == cfg.to_dict():
                     print("  already completed; keeping existing results", flush=True)
                     continue
             last = out / "last_checkpoint.pt"
